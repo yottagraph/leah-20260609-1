@@ -1,150 +1,192 @@
 <template>
-    <div class="home-page">
-        <div class="home-content">
-            <div class="hero-section">
-                <img src="/LL-logo-full-wht.svg" alt="Lovelace" class="hero-logo" />
-                <h1 class="hero-title">{{ appName || 'Welcome to Aether' }}</h1>
-                <p class="hero-subtitle">Your AI-powered workspace is ready.</p>
-            </div>
-
-            <div class="getting-started">
-                <h2 class="section-title">Getting Started</h2>
-                <div class="steps-grid">
-                    <div class="step-item">
-                        <span class="step-number">1</span>
-                        <div>
-                            <div class="step-title">Describe what you want</div>
-                            <div class="step-desc">
-                                Edit <code>DESIGN.md</code> with your project vision. The AI agent
-                                reads this first to understand what to build.
-                            </div>
-                        </div>
-                    </div>
-                    <div class="step-item">
-                        <span class="step-number">2</span>
-                        <div>
-                            <div class="step-title">Build it</div>
-                            <div class="step-desc">
-                                Run <code>/build_my_app</code> in Cursor. The agent will design and
-                                implement your app based on the brief.
-                            </div>
-                        </div>
-                    </div>
-                    <div class="step-item">
-                        <span class="step-number">3</span>
-                        <div>
-                            <div class="step-title">Deploy</div>
-                            <div class="step-desc">
-                                Push to main to auto-deploy on Vercel. Use
-                                <code>/deploy_agent</code> or <code>/deploy_mcp</code> for backend
-                                services.
-                            </div>
-                        </div>
-                    </div>
+    <v-container fluid class="fill-height pa-0 app-scroll-locked">
+        <div class="d-flex flex-column" style="height: 100%; width: 100%">
+            <div class="flex-shrink-0 d-flex flex-column align-center pa-4 search-area">
+                <h1 class="page-title mb-2">Entity Explorer</h1>
+                <p class="page-subtitle mb-4">
+                    Search the knowledge graph and traverse one-hop relationships
+                </p>
+                <EntitySearch @selected="onSelected" />
+                <div v-if="focus" class="mt-3 d-flex ga-2 align-center flex-wrap justify-center">
+                    <v-chip
+                        v-if="historyChips.length > 1"
+                        size="small"
+                        variant="tonal"
+                        prepend-icon="mdi-history"
+                    >
+                        {{ historyChips.length }} in history
+                    </v-chip>
+                    <v-btn
+                        v-if="historyChips.length > 1"
+                        size="small"
+                        variant="text"
+                        prepend-icon="mdi-arrow-left"
+                        @click="goBack"
+                    >
+                        Back
+                    </v-btn>
+                    <v-btn
+                        size="small"
+                        variant="text"
+                        prepend-icon="mdi-information-outline"
+                        @click="propsOpen = true"
+                    >
+                        Properties
+                    </v-btn>
+                    <v-chip
+                        v-if="counts"
+                        size="small"
+                        variant="tonal"
+                        :color="counts.unique ? 'primary' : 'grey'"
+                    >
+                        {{ counts.unique }} neighbors
+                    </v-chip>
+                    <v-chip v-if="counts && counts.incoming" size="x-small" variant="text">
+                        {{ counts.incoming }} incoming
+                    </v-chip>
+                    <v-chip v-if="counts && counts.outgoing" size="x-small" variant="text">
+                        {{ counts.outgoing }} outgoing
+                    </v-chip>
                 </div>
             </div>
+
+            <div class="flex-grow-1 graph-area">
+                <v-progress-linear v-if="neighborsLoading" indeterminate color="primary" />
+                <v-alert
+                    v-if="error"
+                    type="error"
+                    variant="tonal"
+                    closable
+                    class="ma-4"
+                    @click:close="error = null"
+                >
+                    {{ error }}
+                </v-alert>
+
+                <EntityGraph
+                    :focus="focus"
+                    :neighbors="neighbors"
+                    @focus-node="onSelected"
+                    @focus-click="propsOpen = true"
+                />
+            </div>
         </div>
-    </div>
+
+        <v-navigation-drawer v-model="propsOpen" location="right" temporary width="480">
+            <div class="pa-4">
+                <div class="d-flex align-center mb-4">
+                    <v-icon class="mr-2">mdi-information-outline</v-icon>
+                    <span class="text-h6">Properties</span>
+                    <v-spacer />
+                    <v-btn
+                        icon="mdi-close"
+                        variant="text"
+                        size="small"
+                        @click="propsOpen = false"
+                    />
+                </div>
+                <EntityProperties
+                    :neid="focus?.neid ?? null"
+                    @navigate="onNavigateFromProperties"
+                />
+            </div>
+        </v-navigation-drawer>
+    </v-container>
 </template>
 
 <script setup lang="ts">
-    const { appName } = useAppInfo();
+    interface Entity {
+        neid: string;
+        name: string;
+    }
+
+    interface Neighbor {
+        neid: string;
+        name: string;
+        direction: 'incoming' | 'outgoing' | 'both';
+    }
+
+    const focus = ref<Entity | null>(null);
+    const neighbors = ref<Neighbor[]>([]);
+    const counts = ref<{ incoming: number; outgoing: number; unique: number } | null>(null);
+    const neighborsLoading = ref(false);
+    const error = ref<string | null>(null);
+    const propsOpen = ref(false);
+    const history = ref<Entity[]>([]);
+
+    const historyChips = computed(() => history.value);
+
+    async function focusOn(entity: Entity, pushHistory = true) {
+        focus.value = entity;
+        if (pushHistory) {
+            const last = history.value[history.value.length - 1];
+            if (!last || last.neid !== entity.neid) {
+                history.value.push(entity);
+            }
+        }
+        await loadNeighbors(entity.neid);
+    }
+
+    async function loadNeighbors(neid: string) {
+        neighborsLoading.value = true;
+        error.value = null;
+        neighbors.value = [];
+        counts.value = null;
+        try {
+            const res = await $fetch<{
+                neid: string;
+                counts: { incoming: number; outgoing: number; unique: number };
+                neighbors: Neighbor[];
+            }>(`/api/entity/${encodeURIComponent(neid)}/neighbors`);
+            neighbors.value = res.neighbors;
+            counts.value = res.counts;
+        } catch (e: any) {
+            error.value = e?.statusMessage || e?.message || 'Failed to load neighbors';
+        } finally {
+            neighborsLoading.value = false;
+        }
+    }
+
+    function onSelected(entity: Entity) {
+        focusOn(entity);
+    }
+
+    function onNavigateFromProperties(target: Entity) {
+        focusOn(target);
+    }
+
+    function goBack() {
+        if (history.value.length < 2) return;
+        history.value.pop();
+        const prev = history.value[history.value.length - 1];
+        if (prev) focusOn(prev, false);
+    }
 </script>
 
 <style scoped>
-    .home-page {
-        height: 100%;
-        overflow-y: auto;
-        display: flex;
-        justify-content: center;
-        padding: 48px 24px;
+    .search-area {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     }
 
-    .home-content {
-        max-width: 720px;
-        width: 100%;
-    }
-
-    .hero-section {
-        text-align: center;
-        margin-bottom: 48px;
-    }
-
-    .hero-logo {
-        height: 2rem;
-        width: auto;
-        margin-bottom: 24px;
-        opacity: 0.6;
-    }
-
-    .hero-title {
-        font-family: var(--font-headline);
+    .page-title {
+        font-family: var(--font-headline, sans-serif);
         font-weight: 400;
-        font-size: 2rem;
-        letter-spacing: 0.02em;
-        margin-bottom: 8px;
+        font-size: 1.4rem;
+        letter-spacing: 0.04em;
+        color: #fff;
     }
 
-    .hero-subtitle {
-        color: var(--lv-silver);
-        font-size: 1.1rem;
+    .page-subtitle {
+        color: var(--lv-silver, #9aa0a6);
+        font-size: 0.9rem;
+        margin: 0;
     }
 
-    .getting-started {
-        margin-bottom: 48px;
-    }
-
-    .section-title {
-        font-family: var(--font-headline);
-        font-weight: 400;
-        font-size: 1.1rem;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-        color: var(--lv-silver);
-        margin-bottom: 20px;
-    }
-
-    .steps-grid {
+    .graph-area {
+        position: relative;
+        overflow: hidden;
         display: flex;
         flex-direction: column;
-        gap: 16px;
-    }
-
-    .step-item {
-        display: flex;
-        gap: 16px;
-        align-items: flex-start;
-    }
-
-    .step-number {
-        flex-shrink: 0;
-        width: 28px;
-        height: 28px;
-        border-radius: 50%;
-        background: var(--lv-surface);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-family: var(--font-mono);
-        font-size: 0.8rem;
-        color: var(--lv-green);
-        margin-top: 2px;
-    }
-
-    .step-title {
-        font-weight: 500;
-        margin-bottom: 2px;
-    }
-
-    .step-desc {
-        color: var(--lv-silver);
-        font-size: 0.875rem;
-        line-height: 1.4;
-    }
-
-    .step-desc code {
-        font-size: 0.85em;
-        padding: 1px 5px;
     }
 </style>
